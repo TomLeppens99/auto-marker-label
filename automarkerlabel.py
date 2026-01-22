@@ -42,8 +42,13 @@ nLSTMlayers = 3
 LSTMdropout = .17
 FCnodes = 128
 # Learning parameters
-lr = 0.078
-momentum = 0.65
+lr = 0.001  # Learning rate for AdamW (reduced from 0.078 for SGD)
+momentum = 0.65  # Not used with AdamW, kept for backwards compatibility
+weight_decay = 0.01  # Weight decay for AdamW optimizer
+# Training improvements
+grad_clip_max_norm = 1.0  # Gradient clipping max norm
+validation_split = 0.15  # Proportion of data to use for validation
+early_stopping_patience = 5  # Number of epochs to wait for improvement before stopping
 
 
 # --------------------------------------------------------------------------- #
@@ -231,11 +236,12 @@ def trainAlgorithm(savepath,datapath,markersetpath,fs,num_epochs=10,prevModel=No
     with open(os.path.join(savepath,'trainingvals_' + date.today().strftime("%Y-%m-%d") + '.pickle'),'wb') as f:
         pickle.dump(training_vals,f)
     
-    net, running_loss = train_nn(data_segs,num_mks,max_len,windowIdx,
+    net, running_loss, val_loss_history = train_nn(data_segs,num_mks,max_len,windowIdx,
                                         scaleVals,num_epochs,prevModel,tempCkpt,contFromTemp)
-        
+
+    training_stats = {'running_loss': running_loss, 'val_loss_history': val_loss_history}
     with open(os.path.join(savepath,'training_stats_' + date.today().strftime("%Y-%m-%d") + '.pickle'),'wb') as f:
-        pickle.dump(running_loss,f)
+        pickle.dump(training_stats,f)
     torch.save(net.state_dict(),os.path.join(savepath,'model_'+ date.today().strftime("%Y-%m-%d") + '.ckpt'))  
         
     print('Model saved to %s' % os.path.realpath(savepath))
@@ -303,13 +309,13 @@ def transferLearning(savepath,datapath,modelpath,trainvalpath,markersetpath,
     max_len = trainingvals['max_len']
     
     # Perform transfer learning
-    net, running_loss = train_nn(data_segs,num_mks,max_len,windowIdx,scaleVals,
+    net, running_loss, val_loss_history = train_nn(data_segs,num_mks,max_len,windowIdx,scaleVals,
                                         num_epochs,modelpath,tempCkpt,contFromTemp)
-      
-            
-    with open(os.path.join(savepath,'training_stats_plus' + str(len(filelist)) + 'trials_' + 
+
+    training_stats = {'running_loss': running_loss, 'val_loss_history': val_loss_history}
+    with open(os.path.join(savepath,'training_stats_plus' + str(len(filelist)) + 'trials_' +
                            date.today().strftime("%Y-%m-%d") + '.pickle'),'wb') as f:
-        pickle.dump(running_loss,f)
+        pickle.dump(training_stats,f)
     torch.save(net.state_dict(),os.path.join(savepath,'model_plus' + str(len(filelist)) + 'trials_' +
                                               date.today().strftime("%Y-%m-%d") + '.ckpt')) 
     
@@ -875,8 +881,9 @@ class Net(nn.Module):
 def train_nn(data_segs,num_mks,max_len,windowIdx,scaleVals,num_epochs,prevModel,
              tempCkpt=None,contFromTemp=False):
     '''
-    Train the neural network. 
+    Train the neural network.
     Will use GPU if available.
+    Includes AdamW optimizer, gradient clipping, validation split, and early stopping.
 
     Parameters
     ----------
@@ -890,16 +897,16 @@ def train_nn(data_segs,num_mks,max_len,windowIdx,scaleVals,num_epochs,prevModel,
         indices to use to window data, required input to training function
     scaleVals : list of floats
        mean relative distance, velocity, and acceleration in training set and
-       number of data frames used to calculate these. Used to scale variables 
+       number of data frames used to calculate these. Used to scale variables
        before inputting to neural network.
     num_epochs : int
         number of epoch to train for
     prevModel : string
-        path to the .ckpt file for a previously trained model if using transfer 
+        path to the .ckpt file for a previously trained model if using transfer
         learning
         set to None if not using transfer learning
     tempCkpt : string
-        path to save model training progress after each epoch .ckpt 
+        path to save model training progress after each epoch .ckpt
         Set to None to only save after training completes
     contFromTemp : boolean
         set to True to continue a partially completed training from the tempCkpt file
@@ -910,27 +917,49 @@ def train_nn(data_segs,num_mks,max_len,windowIdx,scaleVals,num_epochs,prevModel,
         trained neural network
     running_loss: list of floats
         running loss for network training
+    val_loss_history: list of floats
+        validation loss history per epoch
 
     '''
-    
+
     # Use GPU if available
-    device = torch.device('cuda:0' if torch.cuda.is_available() else 'cpu')   
-    
-    # Create dataset and torch data loader
-    traindata = markerdata(data_segs,num_mks,windowIdx,scaleVals)
+    device = torch.device('cuda:0' if torch.cuda.is_available() else 'cpu')
+
+    # Create full dataset
+    fulldata = markerdata(data_segs,num_mks,windowIdx,scaleVals)
+
+    # Split into train and validation sets
+    dataset_size = len(fulldata)
+    val_size = int(validation_split * dataset_size)
+    train_size = dataset_size - val_size
+
+    traindata, valdata = torch.utils.data.random_split(
+        fulldata, [train_size, val_size],
+        generator=torch.Generator().manual_seed(42)  # Fixed seed for reproducibility
+    )
+
+    # Create data loaders
     trainloader = torch.utils.data.DataLoader(traindata,batch_size=batch_size,
                                               shuffle=True,collate_fn=pad_collate)
+    valloader = torch.utils.data.DataLoader(valdata,batch_size=batch_size,
+                                            shuffle=False,collate_fn=pad_collate)
+
     # Create neural net
     net = Net(max_len,num_mks).to(device)
-    
+
     # Load previous model if transfer learning
     if (prevModel is not None) and (prevModel != ''):
-        net.load_state_dict(torch.load(prevModel,map_location=device)) 
-    
-    # Define loss function and optimizer
+        net.load_state_dict(torch.load(prevModel,map_location=device))
+
+    # Define loss function and optimizer (AdamW instead of SGD)
     criterion = nn.CrossEntropyLoss()
-    optimizer= torch.optim.SGD(net.parameters(), lr=lr, momentum=momentum)
-    
+    optimizer = torch.optim.AdamW(net.parameters(), lr=lr, weight_decay=weight_decay)
+
+    # Early stopping variables
+    best_val_loss = float('inf')
+    epochs_no_improve = 0
+    best_model_state = None
+
     # Load a partially trained model to complete training
     if contFromTemp == True:
         checkpoint = torch.load(tempCkpt)
@@ -938,41 +967,110 @@ def train_nn(data_segs,num_mks,max_len,windowIdx,scaleVals,num_epochs,prevModel,
         optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
         epoch0 = checkpoint['epoch']
         running_loss = checkpoint['running_loss']
+        val_loss_history = checkpoint.get('val_loss_history', [])
+        best_val_loss = checkpoint.get('best_val_loss', float('inf'))
+        epochs_no_improve = checkpoint.get('epochs_no_improve', 0)
         loss = checkpoint['loss']
         torch.set_rng_state(checkpoint['rng_state'])
     else:
         epoch0 = 0
         running_loss = []
-        
+        val_loss_history = []
+
     # Train Network
     total_step = len(trainloader)
     for epoch in range(epoch0,num_epochs):
+        # Training phase
+        net.train()
+        epoch_train_loss = 0.0
         for i, (data, labels, trials, data_lens) in enumerate(trainloader):
             data = data.to(device)
             labels = torch.LongTensor(labels)
             labels = labels.to(device)
-            
+
             # Forward pass
             outputs = net(data,data_lens)
             loss = criterion(outputs,labels)
-            
+
             # Backward and optimize
             optimizer.zero_grad()
             loss.backward()
+
+            # Gradient clipping
+            torch.nn.utils.clip_grad_norm_(net.parameters(), max_norm=grad_clip_max_norm)
+
             optimizer.step()
-            
+
             running_loss.append(loss.item())
-            
+            epoch_train_loss += loss.item()
+
             # Print stats
             if (i+1) % 10 == 0:
                 print('Epoch [{}/{}], Step [{}/{}], Loss: {:.4f}'.format(epoch+1,num_epochs,i+1,
                                                                          total_step,loss.item()))
+
+        # Validation phase
+        net.eval()
+        val_loss = 0.0
+        val_batches = 0
+        with torch.no_grad():
+            for data, labels, trials, data_lens in valloader:
+                data = data.to(device)
+                labels = torch.LongTensor(labels)
+                labels = labels.to(device)
+
+                outputs = net(data,data_lens)
+                loss = criterion(outputs,labels)
+                val_loss += loss.item()
+                val_batches += 1
+
+        val_loss = val_loss / val_batches if val_batches > 0 else 0
+        val_loss_history.append(val_loss)
+        avg_train_loss = epoch_train_loss / len(trainloader)
+
+        print('Epoch [{}/{}], Train Loss: {:.4f}, Val Loss: {:.4f}'.format(
+            epoch+1, num_epochs, avg_train_loss, val_loss))
+
+        # Early stopping check
+        if val_loss < best_val_loss:
+            best_val_loss = val_loss
+            epochs_no_improve = 0
+            best_model_state = copy.deepcopy(net.state_dict())
+            print(f'Validation loss improved to {val_loss:.4f}')
+        else:
+            epochs_no_improve += 1
+            print(f'No improvement in validation loss for {epochs_no_improve} epoch(s)')
+
+        # Save checkpoint
         if tempCkpt is not None:
-            torch.save({'epoch': epoch+1,'model_state_dict': net.state_dict(),
-                'optimizer_state_dict': optimizer.state_dict(),'running_loss': running_loss,'loss' : loss,
-                'rng_state': torch.get_rng_state()},tempCkpt)
-        
-    return net, running_loss
+            torch.save({
+                'epoch': epoch+1,
+                'model_state_dict': net.state_dict(),
+                'optimizer_state_dict': optimizer.state_dict(),
+                'running_loss': running_loss,
+                'val_loss_history': val_loss_history,
+                'best_val_loss': best_val_loss,
+                'epochs_no_improve': epochs_no_improve,
+                'best_model_state': best_model_state,
+                'loss': loss,
+                'rng_state': torch.get_rng_state()
+            }, tempCkpt)
+
+        # Early stopping
+        if epochs_no_improve >= early_stopping_patience:
+            print(f'Early stopping triggered after {epoch+1} epochs')
+            print(f'Best validation loss: {best_val_loss:.4f}')
+            # Restore best model
+            if best_model_state is not None:
+                net.load_state_dict(best_model_state)
+            break
+
+    # Load best model if early stopping didn't trigger but we have a best model
+    if best_model_state is not None and epochs_no_improve < early_stopping_patience:
+        net.load_state_dict(best_model_state)
+        print(f'Training completed. Loaded best model with validation loss: {best_val_loss:.4f}')
+
+    return net, running_loss, val_loss_history
 
 def predict_nn(modelpath,pts,windowIdx,scaleVals,num_mks,max_len):
     '''
