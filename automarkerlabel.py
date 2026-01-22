@@ -41,6 +41,15 @@ nLSTMcells = 256
 nLSTMlayers = 3
 LSTMdropout = .17
 FCnodes = 128
+
+# Attention and Transformer parameters
+model_type = 'hybrid'  # Options: 'lstm', 'transformer', 'hybrid'
+nAttentionHeads = 8  # Number of attention heads
+nTransformerLayers = 3  # Number of transformer encoder layers
+transformerDim = 256  # Transformer hidden dimension (should match nLSTMcells for hybrid)
+transformerFFDim = 512  # Transformer feedforward dimension
+attentionDropout = 0.1  # Dropout for attention layers
+
 # Learning parameters
 lr = 0.078
 momentum = 0.65
@@ -855,21 +864,153 @@ def pad_collate(batch):
     X_pad = nn.utils.rnn.pad_sequence(X,batch_first=True,padding_value=0)
     return X_pad, Y_out, T_out, x_lens
 
+# Positional Encoding for Transformer
+class PositionalEncoding(nn.Module):
+    """
+    Positional encoding module for transformer models.
+    Adds positional information to input embeddings.
+    """
+    def __init__(self, d_model, max_len=5000, dropout=0.1):
+        super(PositionalEncoding, self).__init__()
+        self.dropout = nn.Dropout(p=dropout)
+
+        # Create positional encoding matrix
+        pe = torch.zeros(max_len, d_model)
+        position = torch.arange(0, max_len, dtype=torch.float).unsqueeze(1)
+        div_term = torch.exp(torch.arange(0, d_model, 2).float() * (-torch.log(torch.tensor(10000.0)) / d_model))
+        pe[:, 0::2] = torch.sin(position * div_term)
+        pe[:, 1::2] = torch.cos(position * div_term)
+        pe = pe.unsqueeze(0)  # Add batch dimension
+        self.register_buffer('pe', pe)
+
+    def forward(self, x):
+        """
+        Args:
+            x: Tensor of shape (batch_size, seq_len, d_model)
+        Returns:
+            Tensor with positional encoding added
+        """
+        x = x + self.pe[:, :x.size(1), :]
+        return self.dropout(x)
+
 # Define network architecture
 class Net(nn.Module):
-    def __init__(self, max_len,num_mks):
-        super(Net,self).__init__()
+    def __init__(self, max_len, num_mks):
+        super(Net, self).__init__()
         self.max_len = max_len
-        self.lstm = nn.LSTM((num_mks-1)*5,nLSTMcells,num_layers=nLSTMlayers,dropout=LSTMdropout)
-        self.fc = nn.Sequential(nn.Linear(max_len*nLSTMcells,FCnodes),
-                            nn.BatchNorm1d(FCnodes),
-                            nn.ReLU(),
-                            nn.Linear(FCnodes,num_mks))
-    def forward(self,x,x_lens):
-        out = torch.nn.utils.rnn.pack_padded_sequence(x.float(),x_lens,batch_first=True,enforce_sorted=False)
-        out, (h_t,h_c) = self.lstm(out)
-        out,_ = torch.nn.utils.rnn.pad_packed_sequence(out,batch_first=True,total_length=self.max_len)
-        out = self.fc(out.view(out.shape[0],-1))
+        self.num_mks = num_mks
+        self.input_dim = (num_mks - 1) * 5
+        self.model_type = model_type
+
+        # Input projection for transformer models
+        if self.model_type in ['transformer', 'hybrid']:
+            self.input_projection = nn.Linear(self.input_dim, transformerDim)
+
+        # LSTM branch (for 'lstm' and 'hybrid' models)
+        if self.model_type in ['lstm', 'hybrid']:
+            self.lstm = nn.LSTM(
+                self.input_dim if self.model_type == 'lstm' else transformerDim,
+                nLSTMcells,
+                num_layers=nLSTMlayers,
+                dropout=LSTMdropout,
+                batch_first=True
+            )
+
+        # Transformer branch (for 'transformer' model)
+        if self.model_type == 'transformer':
+            self.pos_encoder = PositionalEncoding(transformerDim, max_len, attentionDropout)
+            encoder_layers = nn.TransformerEncoderLayer(
+                d_model=transformerDim,
+                nhead=nAttentionHeads,
+                dim_feedforward=transformerFFDim,
+                dropout=attentionDropout,
+                batch_first=True
+            )
+            self.transformer_encoder = nn.TransformerEncoder(
+                encoder_layers,
+                num_layers=nTransformerLayers
+            )
+
+        # Self-attention for hybrid model
+        if self.model_type == 'hybrid':
+            self.multihead_attn = nn.MultiheadAttention(
+                embed_dim=nLSTMcells,
+                num_heads=nAttentionHeads,
+                dropout=attentionDropout,
+                batch_first=True
+            )
+            self.attention_norm = nn.LayerNorm(nLSTMcells)
+
+        # Fully connected head
+        if self.model_type == 'lstm':
+            fc_input_dim = max_len * nLSTMcells
+        elif self.model_type == 'transformer':
+            fc_input_dim = max_len * transformerDim
+        else:  # hybrid
+            fc_input_dim = max_len * nLSTMcells
+
+        self.fc = nn.Sequential(
+            nn.Linear(fc_input_dim, FCnodes),
+            nn.BatchNorm1d(FCnodes),
+            nn.ReLU(),
+            nn.Linear(FCnodes, num_mks)
+        )
+
+    def forward(self, x, x_lens):
+        """
+        Forward pass through the network.
+
+        Args:
+            x: Input tensor of shape (batch_size, seq_len, input_dim)
+            x_lens: List of sequence lengths for packed sequences
+
+        Returns:
+            Output tensor of shape (batch_size, num_mks)
+        """
+        batch_size = x.size(0)
+
+        if self.model_type == 'lstm':
+            # Original LSTM architecture
+            out = torch.nn.utils.rnn.pack_padded_sequence(
+                x.float(), x_lens, batch_first=True, enforce_sorted=False
+            )
+            out, (h_t, h_c) = self.lstm(out)
+            out, _ = torch.nn.utils.rnn.pad_packed_sequence(
+                out, batch_first=True, total_length=self.max_len
+            )
+
+        elif self.model_type == 'transformer':
+            # Pure transformer architecture
+            x = x.float()
+            x = self.input_projection(x)
+            x = self.pos_encoder(x)
+
+            # Create padding mask for transformer
+            max_len = x.size(1)
+            mask = torch.arange(max_len, device=x.device).unsqueeze(0) >= torch.tensor(x_lens, device=x.device).unsqueeze(1)
+
+            out = self.transformer_encoder(x, src_key_padding_mask=mask)
+
+        else:  # hybrid
+            # LSTM + Self-attention architecture
+            x = x.float()
+            x_proj = self.input_projection(x)
+
+            # LSTM processing
+            out = torch.nn.utils.rnn.pack_padded_sequence(
+                x_proj, x_lens, batch_first=True, enforce_sorted=False
+            )
+            out, (h_t, h_c) = self.lstm(out)
+            out, _ = torch.nn.utils.rnn.pad_packed_sequence(
+                out, batch_first=True, total_length=self.max_len
+            )
+
+            # Self-attention on LSTM output
+            attn_out, _ = self.multihead_attn(out, out, out)
+            out = self.attention_norm(out + attn_out)  # Residual connection
+
+        # Fully connected head
+        out = self.fc(out.view(batch_size, -1))
         return out
 
 def train_nn(data_segs,num_mks,max_len,windowIdx,scaleVals,num_epochs,prevModel,

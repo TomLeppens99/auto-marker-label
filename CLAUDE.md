@@ -100,32 +100,103 @@ Script for transfer learning to improve models with new labeled data.
 
 ## Neural Network Architecture
 
-### Model: Multi-Layer LSTM with Fully Connected Head
+### Model Types: LSTM, Transformer, and Hybrid Architectures
 
-**Architecture Parameters (automarkerlabel.py:36-46):**
+The system now supports three neural network architectures with attention mechanisms for improved long-range dependency modeling:
+
+**Architecture Parameters (automarkerlabel.py:36-51):**
 ```python
 batch_size = 100
 nLSTMcells = 256        # LSTM hidden size
 nLSTMlayers = 3         # Number of LSTM layers
 LSTMdropout = 0.17      # Dropout rate
 FCnodes = 128           # Fully connected layer nodes
+
+# Attention and Transformer parameters
+model_type = 'hybrid'   # Options: 'lstm', 'transformer', 'hybrid'
+nAttentionHeads = 8     # Number of attention heads
+nTransformerLayers = 3  # Number of transformer encoder layers
+transformerDim = 256    # Transformer hidden dimension
+transformerFFDim = 512  # Transformer feedforward dimension
+attentionDropout = 0.1  # Dropout for attention layers
+
 lr = 0.078              # Learning rate
 momentum = 0.65         # SGD momentum
 filtfreq = 6            # Low-pass filter cutoff (Hz)
 ```
 
-**Network Structure (automarkerlabel.py:859-873):**
+### Architecture Variants
+
+#### 1. LSTM (Original) - `model_type = 'lstm'`
+**Network Structure:**
 1. **Input:** For each marker, relative distances, velocities, and accelerations to all other markers
    - Shape: `(num_markers-1) * 5` features per marker
-2. **LSTM Layers:** 3 layers with 256 cells each, 17% dropout
-3. **Fully Connected Layers:**
+2. **LSTM Layers:** 3 layers with 256 cells each, 17% dropout, batch_first=True
+3. **Fully Connected Head:**
    - Linear: `max_len * nLSTMcells → 128`
-   - BatchNorm1d
-   - ReLU activation
+   - BatchNorm1d + ReLU activation
    - Linear: `128 → num_markers` (classification output)
 
-**Loss Function:** Cross-entropy loss
-**Optimizer:** SGD with momentum
+**Characteristics:**
+- Sequential processing of time series data
+- Proven architecture for marker labeling
+- Good for short to medium-range dependencies
+- Fully backward compatible with existing models
+
+#### 2. Transformer - `model_type = 'transformer'`
+**Network Structure:**
+1. **Input Projection:** Linear layer `input_dim → transformerDim`
+2. **Positional Encoding:** Sinusoidal position embeddings added to input
+3. **Transformer Encoder:** 3 layers of multi-head self-attention
+   - 8 attention heads per layer
+   - 256-dimensional hidden states
+   - 512-dimensional feedforward network
+   - 10% attention dropout
+   - Padding mask for variable-length sequences
+4. **Fully Connected Head:** Same as LSTM variant
+
+**Characteristics:**
+- Parallel processing of entire sequences
+- Excellent for long-range dependencies
+- Self-attention focuses on relevant time steps
+- More computationally efficient than LSTM for long sequences
+
+#### 3. Hybrid (Recommended) - `model_type = 'hybrid'`
+**Network Structure:**
+1. **Input Projection:** Linear layer `input_dim → transformerDim`
+2. **LSTM Processing:** 3-layer LSTM on projected input
+3. **Multi-Head Self-Attention:** 8-head attention on LSTM output
+4. **Residual Connection:** `output = LayerNorm(lstm_out + attention_out)`
+5. **Fully Connected Head:** Same as other variants
+
+**Characteristics:**
+- Combines strengths of both LSTM and attention
+- LSTM captures local temporal patterns
+- Self-attention captures global dependencies
+- Residual connections and layer normalization for training stability
+- Best performance for complex motion sequences
+
+### Technical Details
+
+**Input Features (all architectures):**
+For each marker trajectory window, the network computes relative features to all other markers:
+- Relative 3D position (x, y, z distances)
+- Relative velocity magnitude
+- Relative acceleration magnitude
+- Total: `(num_markers - 1) * 5` features per time step
+
+**Positional Encoding (transformer/hybrid):**
+- Sinusoidal encoding: `PE(pos, 2i) = sin(pos / 10000^(2i/d))`
+- Applied to sequence before transformer layers
+- Enables model to use sequence order information
+
+**Attention Mechanism:**
+- Multi-head attention allows model to focus on different aspects simultaneously
+- Attention weights show which time steps are most relevant for each prediction
+- Padding masks ensure attention doesn't focus on padded positions
+
+**Loss Function:** Cross-entropy loss (all architectures)
+**Optimizer:** SGD with momentum (all architectures)
 
 ## Data Formats
 
@@ -195,6 +266,47 @@ filtfreq = 6            # Low-pass filter cutoff (Hz)
 - Can take hours to days depending on dataset size
 - Saves model with current date in filename
 - Monitor training loss in `training_stats_*.pickle`
+
+**Choosing Model Architecture:**
+
+To select a model architecture, edit the `model_type` parameter in `automarkerlabel.py` (line 44):
+
+```python
+model_type = 'hybrid'  # Options: 'lstm', 'transformer', 'hybrid'
+```
+
+**Architecture Selection Guide:**
+- **'lstm'**: Use for backward compatibility or if you have existing trained models
+  - Faster training on CPU
+  - Lower memory requirements
+  - Good baseline performance
+
+- **'transformer'**: Use for very long sequences or when parallelization is important
+  - Better at capturing long-range dependencies
+  - More efficient on GPU for long sequences
+  - May require more training data
+
+- **'hybrid'** (Recommended): Best overall performance
+  - Combines local (LSTM) and global (attention) pattern recognition
+  - Slightly higher memory usage than LSTM
+  - Best accuracy for complex motion sequences
+  - Recommended for new models
+
+**Hyperparameter Tuning for Attention Models:**
+
+If using transformer or hybrid models, you can adjust:
+```python
+nAttentionHeads = 8     # More heads = more aspects to attend to (typically 4-16)
+transformerDim = 256    # Match nLSTMcells for hybrid models
+transformerFFDim = 512  # Feedforward dimension (typically 2-4x transformerDim)
+attentionDropout = 0.1  # Dropout for regularization
+```
+
+**Important Notes:**
+- Models trained with one architecture cannot be loaded with a different architecture
+- The `model_type` must match when training and using the model for prediction
+- Transformer models may train slower initially but converge to better performance
+- GPU highly recommended for transformer and hybrid models (10-50x speedup)
 
 ### Using the GUI
 
@@ -294,10 +406,16 @@ filtfreq = 6            # Low-pass filter cutoff (Hz)
 - Monitor loss in `training_stats_*.pickle`
 
 ### Modifying Neural Network
-- Architecture defined in automarkerlabel.py:859-873
-- Hyperparameters at lines 36-46
+- Architecture defined in automarkerlabel.py:867-1019
+  - PositionalEncoding class: lines 867-895
+  - Net class with three architectures: lines 897-1019
+- Hyperparameters at lines 38-51
+  - LSTM parameters: lines 39-43
+  - Attention/Transformer parameters: lines 45-51
+- Model type selection via `model_type` parameter (line 44)
 - Must retrain if architecture changes
-- Update both training and prediction code
+- Ensure `model_type` matches between training and prediction
+- Attention mechanisms work best with GPU acceleration
 
 ### Adding New Markers
 1. Edit marker set in OpenSim
